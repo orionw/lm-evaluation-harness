@@ -727,3 +727,176 @@ def handle_stop_sequences(
     if eos is not None and eos not in until:
         until.append(eos)
     return until
+
+
+from typing import Optional, Tuple, Union, List
+import torch
+import torch.nn as nn
+from transformers import PreTrainedModel, PreTrainedTokenizer, AutoTokenizer, AutoModelForMaskedLM
+from transformers.modeling_outputs import CausalLMOutputWithPast
+
+class EncoderAsPseudoCausalLM(PreTrainedModel):
+    def __init__(
+        self,
+        encoder_model: PreTrainedModel,
+        tokenizer: PreTrainedTokenizer,
+        num_future_masks: int = 2,  # Fixed to 2 as per paper
+    ):
+        super().__init__(encoder_model.config)
+        self.encoder = encoder_model
+        self.tokenizer = tokenizer
+        self.num_future_masks = num_future_masks
+        
+        # Set required attributes for CausalLM interface
+        self.config.is_decoder = True
+        self.config.add_cross_attention = False
+        self.main_input_name = "input_ids"
+        
+    def _prepare_masked_input_for_position(
+        self,
+        input_ids: torch.LongTensor,
+        position: int,
+    ) -> torch.LongTensor:
+        """Masks current position and two future tokens as per paper."""
+        masked_input = input_ids.clone()
+        seq_len = input_ids.shape[1]
+        
+        # Mask current position and two future tokens
+        for i in range(self.num_future_masks + 1):
+            mask_pos = position + i
+            if mask_pos < seq_len:
+                masked_input[:, mask_pos] = self.tokenizer.mask_token_id
+                
+        return masked_input
+        
+    def forward(
+        self,
+        input_ids: Optional[torch.LongTensor] = None,
+        attention_mask: Optional[torch.FloatTensor] = None,
+        labels: Optional[torch.LongTensor] = None,
+        past_key_values: Optional[Tuple[Tuple[torch.FloatTensor]]] = None,
+        return_single_token_logits: bool = False,  # Only return next token for generate()
+        **kwargs
+    ) -> Union[Tuple[torch.Tensor], CausalLMOutputWithPast]:
+        batch_size, seq_len = input_ids.shape
+        device = input_ids.device
+        
+        # For generation or full sequence scoring
+        if return_single_token_logits:
+            # For generation, only compute last position
+            last_pos = seq_len - 1
+            if attention_mask is not None:
+                last_pos = attention_mask.sum(dim=1) - 1
+            
+            masked_input = self._prepare_masked_input_for_position(input_ids, last_pos)
+            outputs = self.encoder(
+                input_ids=masked_input,
+                attention_mask=attention_mask,
+                **kwargs
+            )
+            logits = outputs.logits[:, last_pos:last_pos+1, :]
+            
+        else:
+            # Create batched version of input with each position's masking
+            batched_inputs = torch.zeros(
+                (batch_size * seq_len, seq_len),
+                dtype=input_ids.dtype,
+                device=device
+            )
+            
+            # Prepare all masked versions in parallel
+            for pos in range(seq_len):
+                start_idx = pos * batch_size
+                end_idx = (pos + 1) * batch_size
+                batched_inputs[start_idx:end_idx] = self._prepare_masked_input_for_position(input_ids, pos)
+            
+            # Expand attention mask if needed
+            if attention_mask is not None:
+                batched_attention_mask = attention_mask.repeat(seq_len, 1)
+            else:
+                batched_attention_mask = None
+                
+            # Single forward pass with batched inputs
+            outputs = self.encoder(
+                input_ids=batched_inputs,
+                attention_mask=batched_attention_mask,
+                **kwargs
+            )
+            
+            # Reshape logits back to original sequence format
+            # For each position, take its masked prediction
+            all_logits = torch.zeros(
+                (batch_size, seq_len, self.config.vocab_size),
+                device=device
+            )
+            
+            for pos in range(seq_len):
+                start_idx = pos * batch_size
+                end_idx = (pos + 1) * batch_size
+                all_logits[:, pos, :] = outputs.logits[start_idx:end_idx, pos, :]
+            
+            logits = all_logits
+            
+        loss = None
+        if labels is not None:
+            loss_fct = nn.CrossEntropyLoss()
+            loss = loss_fct(logits.view(-1, self.config.vocab_size), labels.view(-1))
+            
+        return CausalLMOutputWithPast(
+            loss=loss,
+            logits=logits,
+            past_key_values=None,
+        )
+        
+    def prepare_inputs_for_generation(
+        self,
+        input_ids: torch.LongTensor,
+        past_key_values: Optional[Tuple[Tuple[torch.FloatTensor]]] = None,
+        attention_mask: Optional[torch.FloatTensor] = None,
+        **kwargs
+    ) -> dict:
+        return {
+            "input_ids": input_ids,
+            "attention_mask": attention_mask,
+            "return_single_token_logits": True,
+            **kwargs
+        }
+        
+    @staticmethod
+    def _reorder_cache(*args, **kwargs):
+        pass
+
+def convert_encoder_to_causal_lm(
+        pretrained: str,
+        revision: Optional[str] = None,
+        torch_dtype: Optional[torch.dtype] = None,
+        trust_remote_code: Optional[bool] = None,
+        gguf_file: Optional[str] = None,
+        **model_kwargs,
+):
+    """
+    Converts an encoder-only model to behave like a CausalLM using the improved PLL scoring
+    approach that masks the current token and two future tokens.
+    """
+    if gguf_file is not None:
+        raise NotImplementedError("GGUF support not yet implemented")
+        
+    model_kwargs = {
+        "revision": revision,
+        "torch_dtype": torch_dtype,
+        "trust_remote_code": trust_remote_code,
+        **model_kwargs
+    }
+    
+    tokenizer = AutoTokenizer.from_pretrained(pretrained, **model_kwargs)
+    model = AutoModelForMaskedLM.from_pretrained(pretrained, **model_kwargs)
+    
+    wrapped_model = EncoderAsPseudoCausalLM(
+        encoder_model=model,
+        tokenizer=tokenizer,
+    )
+    
+    wrapped_model.config.architectures = ["EncoderAsPseudoCausalLM"]
+    wrapped_model.config.model_type = "encoder_as_pseudo_causal_lm"
+    
+    return wrapped_model
