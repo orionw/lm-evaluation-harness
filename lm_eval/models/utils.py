@@ -740,7 +740,7 @@ class EncoderAsPseudoCausalLM(PreTrainedModel):
         self,
         encoder_model: PreTrainedModel,
         tokenizer: PreTrainedTokenizer,
-        num_future_masks: int = 2,  # Fixed to 2 as per paper
+        num_future_masks: int = 2
     ):
         super().__init__(encoder_model.config)
         self.encoder = encoder_model
@@ -758,15 +758,25 @@ class EncoderAsPseudoCausalLM(PreTrainedModel):
         position: int,
     ) -> torch.LongTensor:
         """Masks current position and two future tokens as per paper."""
-        masked_input = input_ids.clone()
+        batch_size = input_ids.shape[0]
         seq_len = input_ids.shape[1]
         
-        # Mask current position and two future tokens
+        # Create new tensor with extra space for masks and EOS
+        new_seq_len = seq_len + self.num_future_masks + 1  # Add space for masks and EOS
+        masked_input = torch.zeros((batch_size, new_seq_len), dtype=input_ids.dtype, device=input_ids.device)
+        
+        # Copy original sequence
+        masked_input[:, :seq_len] = input_ids
+        
+        # Mask current position and future tokens
         for i in range(self.num_future_masks + 1):
             mask_pos = position + i
-            if mask_pos < seq_len:
+            if mask_pos < new_seq_len:
                 masked_input[:, mask_pos] = self.tokenizer.mask_token_id
-                
+        
+        # Add EOS token at the end
+        masked_input[:, -1] = self.tokenizer.sep_token_id
+        
         return masked_input
         
     def forward(
@@ -780,6 +790,7 @@ class EncoderAsPseudoCausalLM(PreTrainedModel):
     ) -> Union[Tuple[torch.Tensor], CausalLMOutputWithPast]:
         batch_size, seq_len = input_ids.shape
         device = input_ids.device
+        assert batch_size == 1, f"Batch size must be 1 for EncoderAsPseudoCausalLM, got {batch_size}"
         
         # For generation or full sequence scoring
         if return_single_token_logits:
@@ -787,14 +798,17 @@ class EncoderAsPseudoCausalLM(PreTrainedModel):
             last_pos = seq_len - 1
             if attention_mask is not None:
                 last_pos = attention_mask.sum(dim=1) - 1
+
             
             masked_input = self._prepare_masked_input_for_position(input_ids, last_pos)
+            attention_mask = torch.ones_like(masked_input)
             outputs = self.encoder(
                 input_ids=masked_input,
                 attention_mask=attention_mask,
                 **kwargs
             )
-            logits = outputs.logits[:, last_pos:last_pos+1, :]
+            # return only the first masked token (e.g. -4)
+            logits = outputs.logits[:, -4, :]
             
         else:
             # Create batched version of input with each position's masking
@@ -810,11 +824,8 @@ class EncoderAsPseudoCausalLM(PreTrainedModel):
                 end_idx = (pos + 1) * batch_size
                 batched_inputs[start_idx:end_idx] = self._prepare_masked_input_for_position(input_ids, pos)
             
-            # Expand attention mask if needed
-            if attention_mask is not None:
-                batched_attention_mask = attention_mask.repeat(seq_len, 1)
-            else:
-                batched_attention_mask = None
+            # create proper attention mask for each step
+            batched_attention_mask = torch.triu(torch.ones_like(batched_inputs), diagonal=1)
                 
             # Single forward pass with batched inputs
             outputs = self.encoder(

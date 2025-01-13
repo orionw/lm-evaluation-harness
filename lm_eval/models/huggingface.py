@@ -1071,21 +1071,23 @@ class HFLM(TemplateLM):
             ):
                 # Process one continuation at a time
                 for orig_idx, request_str, cont_tokens in continuations:
-                    input_ids = torch.tensor(
-                        list(context_enc) + [self.tokenizer.mask_token_id],
-                        device=self.device,
-                        dtype=torch.long
-                    ).unsqueeze(0)  # [1, seq_len]
-                    
                     total_score = 0.0
-                    all_greedy = True  # Track if all predictions were greedy
-                    
+                    all_greedy = True
+                    current_sequence = list(context_enc)  # Keep track of full sequence
+
                     # Score each token in the continuation
                     for token in cont_tokens:
+                        # Add mask token for prediction
+                        input_with_mask = torch.tensor(
+                            current_sequence + [self.tokenizer.mask_token_id],
+                            device=self.device,
+                            dtype=torch.long
+                        ).unsqueeze(0)
+                        
                         with torch.no_grad():
                             outputs = self.model(
-                                input_ids=input_ids,
-                                attention_mask=torch.ones_like(input_ids),
+                                input_ids=input_with_mask,
+                                attention_mask=torch.ones_like(input_with_mask),
                                 return_single_token_logits=True
                             )
                         
@@ -1101,13 +1103,9 @@ class HFLM(TemplateLM):
                         if greedy_token != token:
                             all_greedy = False
                         
-                        # Update input for next token's scoring
-                        input_ids = torch.tensor(
-                            list(context_enc) + [self.tokenizer.mask_token_id],
-                            device=self.device,
-                            dtype=torch.long
-                        ).unsqueeze(0)
-                    
+                        # Add the true token to our sequence for next prediction
+                        current_sequence.append(token)
+                                            
                     # Store results including whether sequence was greedy
                     res[orig_idx] = (total_score, all_greedy)
                     

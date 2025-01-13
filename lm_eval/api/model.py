@@ -347,7 +347,15 @@ class TemplateLM(LM):
 
         model_class = getattr(self, "AUTO_MODEL_CLASS", None)
 
-        if model_class == transformers.AutoModelForSeq2SeqLM:
+        if self.is_encoder:
+            context_enc = self.tok_encode(context)
+            # remove the eos token from the context
+            eos_token_id = context_enc[-1]
+            context_enc = context_enc[:-1]
+            continuation_enc = self.tok_encode(continuation, add_special_tokens=False)
+            # add the eos token to the continuation
+            continuation_enc += [eos_token_id]
+        elif model_class == transformers.AutoModelForSeq2SeqLM:
             context_enc = self.tok_encode(context)
             continuation_enc = self.tok_encode(continuation, add_special_tokens=False)
         else:
@@ -365,6 +373,7 @@ class TemplateLM(LM):
         new_reqs = []
         for context, continuation in [req.args for req in requests]:
             if context == "":
+                breakpoint()
                 # BOS or EOS as context
                 context_enc, continuation_enc = (
                     [self.prefix_token_id],
