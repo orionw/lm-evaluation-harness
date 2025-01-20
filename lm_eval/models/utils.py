@@ -790,52 +790,48 @@ class EncoderAsPseudoCausalLM(PreTrainedModel):
     ) -> Union[Tuple[torch.Tensor], CausalLMOutputWithPast]:
         batch_size, seq_len = input_ids.shape
         device = input_ids.device
-        assert batch_size == 1, f"Batch size must be 1 for EncoderAsPseudoCausalLM, got {batch_size}"
         
-        # For generation or full sequence scoring
+        # For generation or single token prediction
         if return_single_token_logits:
-            # For generation, only compute last position
+            # For batched generation, all sequences will have same length
             last_pos = seq_len - 1
-            if attention_mask is not None:
-                last_pos = attention_mask.sum(dim=1) - 1
-
             
+            # Prepare masked input for the batch
             masked_input = self._prepare_masked_input_for_position(input_ids, last_pos)
             attention_mask = torch.ones_like(masked_input)
+            
             outputs = self.encoder(
                 input_ids=masked_input,
                 attention_mask=attention_mask,
                 **kwargs
             )
-            # return only the first masked token (e.g. -4)
+            
+            # Return only the first masked token logits
             logits = outputs.logits[:, -4, :]
             
         else:
-            # Create batched version of input with each position's masking
+            # Original full sequence scoring logic - maintain batch_size=1 requirement
+            assert batch_size == 1, f"Batch size must be 1 for full sequence scoring, got {batch_size}"
+            
             batched_inputs = torch.zeros(
                 (batch_size * seq_len, seq_len),
                 dtype=input_ids.dtype,
                 device=device
             )
             
-            # Prepare all masked versions in parallel
             for pos in range(seq_len):
                 start_idx = pos * batch_size
                 end_idx = (pos + 1) * batch_size
                 batched_inputs[start_idx:end_idx] = self._prepare_masked_input_for_position(input_ids, pos)
             
-            # create proper attention mask for each step
             batched_attention_mask = torch.triu(torch.ones_like(batched_inputs), diagonal=1)
                 
-            # Single forward pass with batched inputs
             outputs = self.encoder(
                 input_ids=batched_inputs,
                 attention_mask=batched_attention_mask,
                 **kwargs
             )
             
-            # Reshape logits back to original sequence format
-            # For each position, take its masked prediction
             all_logits = torch.zeros(
                 (batch_size, seq_len, self.config.vocab_size),
                 device=device
@@ -866,7 +862,7 @@ class EncoderAsPseudoCausalLM(PreTrainedModel):
         attention_mask: Optional[torch.FloatTensor] = None,
         **kwargs
     ) -> dict:
-        return {
+        return {        
             "input_ids": input_ids,
             "attention_mask": attention_mask,
             "return_single_token_logits": True,

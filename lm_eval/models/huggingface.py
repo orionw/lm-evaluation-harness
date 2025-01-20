@@ -1049,9 +1049,8 @@ class HFLM(TemplateLM):
         disable_tqdm: bool = False,
         override_bs: int = None,
     ) -> List[Tuple[float, bool]]:
-        if  self.is_encoder:
+        if self.is_encoder:
             eval_logger.info("Processing encoder model with continuation scoring")
-            batch_size = 1  # Force batch size of 1 for simplicity
 
             # Group requests by context
             context_groups = {}
@@ -1069,54 +1068,74 @@ class HFLM(TemplateLM):
                 disable=(disable_tqdm or (self.rank != 0)),
                 desc="Processing contexts"
             ):
-                # Process one continuation at a time
-                for orig_idx, request_str, cont_tokens in continuations:
-                    total_score = 0.0
-                    all_greedy = True
-                    current_sequence = list(context_enc)  # Keep track of full sequence
-
-                    # Score each token in the continuation
-                    for token in cont_tokens:
-                        # Add mask token for prediction
-                        input_with_mask = torch.tensor(
-                            current_sequence + [self.tokenizer.mask_token_id],
-                            device=self.device,
-                            dtype=torch.long
-                        ).unsqueeze(0)
-                        
-                        with torch.no_grad():
-                            outputs = self.model(
-                                input_ids=input_with_mask,
-                                attention_mask=torch.ones_like(input_with_mask),
-                                return_single_token_logits=True
-                            )
-                        
-                        # Handle logits shape (batch_size=1, 1, vocab)
-                        logits = outputs.logits.squeeze(1)  # [1, vocab]
-                        log_probs = F.log_softmax(logits, dim=-1)
-                        
+                # Initialize tracking for all continuations in this group
+                max_cont_len = max(len(cont) for _, _, cont in continuations)
+                current_sequences = [list(context_enc) for _ in continuations]
+                total_scores = [0.0 for _ in continuations]
+                all_greedy = [True for _ in continuations]
+                active_continuations = set(range(len(continuations)))
+                
+                # Process tokens position by position
+                for pos in range(max_cont_len):
+                    # Prepare batch for active continuations
+                    batch_inputs = []
+                    batch_indices = []
+                    true_tokens = []
+                    
+                    for cont_idx in list(active_continuations):
+                        _, _, cont_tokens = continuations[cont_idx]
+                        if pos < len(cont_tokens):
+                            batch_inputs.append(current_sequences[cont_idx] + [self.tokenizer.mask_token_id])
+                            batch_indices.append(cont_idx)
+                            true_tokens.append(cont_tokens[pos])
+                        else:
+                            active_continuations.remove(cont_idx)
+                    
+                    if not batch_indices:
+                        break
+                    
+                    # Process the entire batch at once
+                    input_ids = torch.tensor(
+                        batch_inputs,
+                        device=self.device,
+                        dtype=torch.long
+                    )
+                    
+                    with torch.no_grad():
+                        outputs = self.model(
+                            input_ids=input_ids,
+                            attention_mask=torch.ones_like(input_ids),
+                            return_single_token_logits=True
+                        )
+                    
+                    logits = outputs.logits  # [batch_size, vocab]
+                    log_probs = F.log_softmax(logits, dim=-1)
+                    
+                    # Update scores and check greedy for each continuation
+                    for batch_idx, (cont_idx, true_token) in enumerate(zip(batch_indices, true_tokens)):
                         # Add log probability of the true token
-                        total_score += log_probs[0, token].item()
+                        total_scores[cont_idx] += log_probs[batch_idx, true_token].item()
                         
                         # Check if this token was the greedy choice
-                        greedy_token = logits[0].argmax().item()
-                        if greedy_token != token:
-                            all_greedy = False
+                        greedy_token = logits[batch_idx].argmax().item()
+                        if greedy_token != true_token:
+                            all_greedy[cont_idx] = False
                         
-                        # Add the true token to our sequence for next prediction
-                        current_sequence.append(token)
-                                            
-                    # Store results including whether sequence was greedy
-                    res[orig_idx] = (total_score, all_greedy)
+                        # Update sequence for next prediction
+                        current_sequences[cont_idx].append(true_token)
+                
+                # Store results for all continuations in this context group
+                for cont_idx, (orig_idx, request_str, _) in enumerate(continuations):
+                    res[orig_idx] = (total_scores[cont_idx], all_greedy[cont_idx])
                     
                     if request_str is not None:
                         self.cache_hook.add_partial(
                             "loglikelihood",
                             request_str,
-                            (total_score, all_greedy)
+                            (total_scores[cont_idx], all_greedy[cont_idx])
                         )
 
-                    clear_torch_cache()
+                clear_torch_cache()
 
             return res
         else:
