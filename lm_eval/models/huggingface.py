@@ -1059,7 +1059,8 @@ class HFLM(TemplateLM):
                 if context_key not in context_groups:
                     context_groups[context_key] = []
                 context_groups[context_key].append((idx, request_str, continuation_enc))
-            
+                # context_groups[context_key].append((idx, request_str, continuation_enc[:-1]))
+
             res = [None] * len(requests)
             
             # Process each context group
@@ -1118,6 +1119,7 @@ class HFLM(TemplateLM):
                         
                         # Check if this token was the greedy choice
                         greedy_token = logits[batch_idx].argmax().item()
+                        # print(f"Greedy token: {self.tokenizer.decode(greedy_token)}, True token: {self.tokenizer.decode(true_token)}")
                         if greedy_token != true_token:
                             all_greedy[cont_idx] = False
                         

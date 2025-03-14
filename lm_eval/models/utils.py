@@ -740,13 +740,14 @@ class EncoderAsPseudoCausalLM(PreTrainedModel):
         self,
         encoder_model: PreTrainedModel,
         tokenizer: PreTrainedTokenizer,
-        num_future_masks: int = 2
+        num_future_masks: int = 2,
+        uses_mtnp: bool = False,
     ):
         super().__init__(encoder_model.config)
         self.encoder = encoder_model
         self.tokenizer = tokenizer
         self.num_future_masks = num_future_masks
-        
+        self.uses_mtnp = uses_mtnp
         # Set required attributes for CausalLM interface
         self.config.is_decoder = True
         self.config.add_cross_attention = False
@@ -791,7 +792,7 @@ class EncoderAsPseudoCausalLM(PreTrainedModel):
         batch_size, seq_len = input_ids.shape
         device = input_ids.device
         
-        # For generation or single token prediction
+        # For likelihood calculations
         if return_single_token_logits:
             # For batched generation, all sequences will have same length
             last_pos = seq_len - 1
@@ -807,43 +808,29 @@ class EncoderAsPseudoCausalLM(PreTrainedModel):
             )
             
             # Return only the first masked token logits
-            # Add sequence dimension for compatibility with HF generation code
-            logits = outputs.logits[:, -4, :].unsqueeze(1)  # [batch_size, 1, vocab_size]
+            next_token_offset = 2 if not self.uses_mtnp else 3
+            logits = outputs.logits[:, -1 * (next_token_offset + self.num_future_masks), :]  # [batch_size, 1, vocab_size]
             
         else:
-            # Original full sequence scoring logic - maintain batch_size=1 requirement
+            # For generation
             assert batch_size == 1, f"Batch size must be 1 for full sequence scoring, got {batch_size}"
+
+            # remove the eos token if at the end
+            if self.tokenizer.sep_token_id == input_ids[0, -1]:
+                input_ids = input_ids[:, :-1]
+                seq_len -= 1
             
-            batched_inputs = torch.zeros(
-                (batch_size * seq_len, seq_len),
-                dtype=input_ids.dtype,
-                device=device
-            )
-            
-            for pos in range(seq_len):
-                start_idx = pos * batch_size
-                end_idx = (pos + 1) * batch_size
-                batched_inputs[start_idx:end_idx] = self._prepare_masked_input_for_position(input_ids, pos)
-            
-            batched_attention_mask = torch.triu(torch.ones_like(batched_inputs), diagonal=1)
+            extended_input_ids = self._prepare_masked_input_for_position(input_ids, seq_len)
+            attention_mask = torch.ones_like(extended_input_ids)
                 
             outputs = self.encoder(
-                input_ids=batched_inputs,
-                attention_mask=batched_attention_mask,
+                input_ids=extended_input_ids,
+                attention_mask=attention_mask,
                 **kwargs
             )
-            
-            all_logits = torch.zeros(
-                (batch_size, seq_len, self.config.vocab_size),
-                device=device
-            )
-            
-            for pos in range(seq_len):
-                start_idx = pos * batch_size
-                end_idx = (pos + 1) * batch_size
-                all_logits[:, pos, :] = outputs.logits[start_idx:end_idx, pos, :]
-            
-            logits = all_logits
+            # Return only the first masked token logits
+            next_token_offset = 1 if not self.uses_mtnp else 2 # or the one before it if NMTP
+            logits = outputs.logits[:, -1 * (next_token_offset + self.num_future_masks), :].squeeze(0)  # [batch_size, vocab_size]
             
         loss = None
         if labels is not None:
@@ -866,7 +853,7 @@ class EncoderAsPseudoCausalLM(PreTrainedModel):
         return {        
             "input_ids": input_ids,
             "attention_mask": attention_mask,
-            "return_single_token_logits": True,
+            "return_single_token_logits": "use_cache" not in kwargs or not kwargs["use_cache"],
             **kwargs
         }
         
@@ -896,12 +883,14 @@ def convert_encoder_to_causal_lm(
         **model_kwargs
     }
     
+    uses_mtnp = model_kwargs.pop("uses_mtnp", False)
     tokenizer = AutoTokenizer.from_pretrained(pretrained, **model_kwargs)
     model = AutoModelForMaskedLM.from_pretrained(pretrained, **model_kwargs)
     
     wrapped_model = EncoderAsPseudoCausalLM(
         encoder_model=model,
         tokenizer=tokenizer,
+        uses_mtnp=uses_mtnp,
     )
     
     wrapped_model.config.architectures = ["EncoderAsPseudoCausalLM"]
