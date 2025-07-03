@@ -468,6 +468,11 @@ class HFMultimodalLM(HFLM):
         )
 
         chunks = re_ord.get_batched(n=batch_size, batch_fn=batch_fn)
+        # Handle case where eot_token_id might be None and wrap single token in list for tok_decode
+        if self.eot_token_id is not None:
+            eos = self.tok_decode([self.eot_token_id], skip_special_tokens=False)
+        else:
+            eos = ""
         pbar = tqdm(
             total=len(requests),
             disable=(disable_tqdm or (self.rank != 0)),

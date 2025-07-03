@@ -799,7 +799,7 @@ class EncoderAsPseudoCausalLM(PreTrainedModel):
             # Prepare masked input for the batch
             masked_input = self._prepare_masked_input_for_position(input_ids, last_pos)
             attention_mask = torch.ones_like(masked_input)
-            
+
             outputs = self.encoder(
                 input_ids=masked_input,
                 attention_mask=attention_mask,
@@ -807,7 +807,8 @@ class EncoderAsPseudoCausalLM(PreTrainedModel):
             )
             
             # Return only the first masked token logits
-            logits = outputs.logits[:, -4, :]
+            # Add sequence dimension for compatibility with HF generation code
+            logits = outputs.logits[:, -4, :].unsqueeze(1)  # [batch_size, 1, vocab_size]
             
         else:
             # Original full sequence scoring logic - maintain batch_size=1 requirement

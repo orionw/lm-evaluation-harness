@@ -1414,7 +1414,11 @@ class HFLM(TemplateLM):
             group_fn=lambda x: x[1],
         )
         chunks = re_ords.get_batched(n=batch_size, batch_fn=batch_fn)
-        eos = self.tok_decode(self.eot_token_id, skip_special_tokens=False)
+        # Handle case where eot_token_id might be None and wrap single token in list for tok_decode
+        if self.eot_token_id is not None:
+            eos = self.tokenizer.decode([self.eot_token_id])
+        else:
+            eos = self.tokenizer.eos_token_id
         for chunk in chunks:
             contexts, all_gen_kwargs = zip(*chunk)
             # we assume all gen kwargs in the batch are the same
