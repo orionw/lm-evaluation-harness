@@ -757,8 +757,13 @@ class EncoderAsPseudoCausalLM(PreTrainedModel):
         self,
         input_ids: torch.LongTensor,
         position: int,
+        num_masks: int = None,
+        eos_token: int = self.tokenizer.sep_token_id
     ) -> torch.LongTensor:
         """Masks current position and two future tokens as per paper."""
+        if num_masks is None:
+            num_masks = self.num_future_masks
+
         batch_size = input_ids.shape[0]
         seq_len = input_ids.shape[1]
         
@@ -776,7 +781,7 @@ class EncoderAsPseudoCausalLM(PreTrainedModel):
                 masked_input[:, mask_pos] = self.tokenizer.mask_token_id
         
         # Add EOS token at the end
-        masked_input[:, -1] = self.tokenizer.sep_token_id
+        masked_input[:, -1] = eos_token
         
         return masked_input
         
@@ -798,7 +803,7 @@ class EncoderAsPseudoCausalLM(PreTrainedModel):
             last_pos = seq_len - 1
             
             # Prepare masked input for the batch
-            masked_input = self._prepare_masked_input_for_position(input_ids, last_pos)
+            masked_input = self._prepare_masked_input_for_position(input_ids, last_pos, num_masks=num_masks+1, eos_token=15)
             attention_mask = torch.ones_like(masked_input)
 
             outputs = self.encoder(
@@ -830,7 +835,14 @@ class EncoderAsPseudoCausalLM(PreTrainedModel):
             )
             # Return only the first masked token logits
             next_token_offset = 1 if not self.uses_mtnp else 2 # or the one before it if NMTP
-            logits = outputs.logits[:, -1 * (next_token_offset + self.num_future_masks), :].squeeze(0)  # [batch_size, vocab_size]
+            logits = outputs.logits[:, -1 * (next_token_offset + self.num_future_masks + 1), :].unsqueeze(1)  # [batch_size, 1, vocab_size]
+        
+            # print out the argmax logit
+            print(f"Forward called with seq_len: {seq_len}")
+            print(f"Input shape: {input_ids.shape}")
+            print(f"Predicted token ID: {logits.argmax(dim=-1).item()}")
+            print(f"Is EOS?: {logits.argmax(dim=-1).item() == self.tokenizer.eos_token_id}")
+            print(f"Decoded: {self.tokenizer.decode(logits.argmax(dim=-1).item())}")
             
         loss = None
         if labels is not None:

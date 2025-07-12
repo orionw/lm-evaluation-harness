@@ -911,7 +911,7 @@ class HFLM(TemplateLM):
         stopping_criteria = stop_sequences_criteria(
             self.tokenizer, stop, context.shape[1], context.shape[0]
         )
-        return self.model.generate(
+        output = self.model.generate(
             input_ids=context,
             max_length=max_length,
             stopping_criteria=stopping_criteria,
@@ -919,6 +919,9 @@ class HFLM(TemplateLM):
             use_cache=True,
             **generation_kwargs,
         )
+        # print output in text and the input
+        print("Output", self.tokenizer.decode(output[0]))
+        return output
 
     def _select_cont_toks(
         self, logits: torch.Tensor, contlen: int = None, inplen: int = None
